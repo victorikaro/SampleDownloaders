@@ -6,7 +6,7 @@ Rodar direto:  pip install -U yt-dlp mutagen pillow   ->   python baixador_youtu
 Precisa do ffmpeg (no PATH ou ffmpeg.exe ao lado do programa).
 Para virar .exe com atualização automática, veja launcher.py e build_exe.bat.
 """
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 
 import io
 import json
@@ -514,8 +514,9 @@ class App:
         st.configure("TNotebook.Tab", background=fld, foreground=fg)
         st.map("TCombobox", fieldbackground=[("readonly", fld)], foreground=[("readonly", fg)])
         self.root.configure(bg=bg)
-        for w in (self.log, self.tracks, self.extra):
+        for w in (self.log, self.extra):  # Text aceita cursor colorido
             w.configure(bg=fld, fg=fg, insertbackground=fg)
+        self.tracks.configure(bg=fld, fg=fg)  # Listbox não tem insertbackground
 
     def open_dir(self):
         d = self.outdir.get()
