@@ -6,7 +6,7 @@ Rodar direto:  pip install -U yt-dlp mutagen pillow   ->   python baixador_youtu
 Precisa do ffmpeg (no PATH ou ffmpeg.exe ao lado do programa).
 Para virar .exe com atualização automática, veja launcher.py e build_exe.bat.
 """
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 import io
 import json
@@ -97,6 +97,23 @@ def cover_jpeg(img, crop):
     return buf.getvalue(), "image/jpeg"
 
 
+# ---------- textos ignorados ----------
+def parse_words(text):
+    return [w.strip() for w in re.split(r"[,\n]", text) if w.strip()]
+
+
+def clean(text, words):
+    """Remove os textos ignorados (sem diferenciar maiúsculas/minúsculas) e arruma o que sobrar."""
+    if not words or not text:
+        return text
+    for w in words:
+        text = re.sub(re.escape(w), "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\(\s*\)|\[\s*\]|\{\s*\}", "", text)          # parênteses vazios
+    text = re.sub(r"(\s[-–—|]\s*){2,}", " - ", text)               # separadores duplicados
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip(" -–—_|")
+
+
 # ---------- YouTube / metadados ----------
 def probe(url, single):
     """Lê o link sem baixar. Retorna (é_playlist, álbum, entradas, urls_da_capa, info)."""
@@ -113,8 +130,8 @@ def probe(url, single):
     return False, None, [{"url": url, "id": info.get("id"), "title": info.get("title")}], urls, info
 
 
-def build_meta(info, album, idx, total):
-    title = info.get("track") or info.get("title") or ""
+def build_meta(info, album, idx, total, words=()):
+    title = clean(info.get("track") or info.get("title") or "", words)
     artist = info.get("artist") or info.get("creator")
     if isinstance(artist, (list, tuple)):
         artist = ", ".join(artist)
@@ -123,8 +140,8 @@ def build_meta(info, album, idx, total):
             artist, title = [s.strip() for s in title.split(" - ", 1)]
         else:
             artist = info.get("channel") or info.get("uploader") or ""
-    artist = re.sub(r"\s*-\s*Topic$", "", artist)
-    return {"title": title, "artist": artist, "album": album or info.get("album") or title,
+    artist = clean(re.sub(r"\s*-\s*Topic$", "", artist), words)
+    return {"title": title, "artist": artist, "album": clean(album or info.get("album") or title, words),
             "year": (info.get("upload_date") or "")[:4], "idx": idx, "total": total}
 
 
@@ -191,6 +208,7 @@ class App:
         self.single = tk.BooleanVar(value=s.get("single", False))
         self.crop_mode = tk.StringVar(value=s.get("crop_mode", "square"))
         self.zoom = tk.DoubleVar(value=1.0)
+        self.ignore = tk.StringVar(value=s.get("ignore", ""))
         self.outdir = tk.StringVar(value=s.get("outdir") or os.path.join(os.path.expanduser("~"), "Downloads"))
         self.status = tk.StringVar(value=os.environ.get("BYT_NOTE") or "Pronto.")
 
@@ -233,6 +251,10 @@ class App:
         ttk.Scale(r, from_=0.4, to=1.0, variable=self.zoom, command=lambda _v: self.draw()).pack(side="left", fill="x", expand=True, padx=6)
         ttk.Label(right, text="Arraste sobre a imagem para posicionar o corte.", foreground="#666").pack(anchor="w")
 
+        ttk.Label(p, text="Ignorar textos no nome do arquivo e nos metadados (separe por vírgula):").pack(anchor="w", pady=(10, 0))
+        ttk.Entry(p, textvariable=self.ignore).pack(fill="x", pady=2)
+        ttk.Label(p, text="Ex.: [Official Audio], (Official Video), (Lyrics)", foreground="#666").pack(anchor="w")
+
         ttk.Label(p, text="Salvar em:").pack(anchor="w", pady=(10, 0))
         row = ttk.Frame(p); row.pack(fill="x", pady=2)
         ttk.Entry(row, textvariable=self.outdir).pack(side="left", fill="x", expand=True)
@@ -257,7 +279,8 @@ class App:
     # --- configurações ---
     def save_settings(self):
         save_cfg({"outdir": self.outdir.get(), "fmt": self.fmt.get(), "quality": self.quality.get(),
-                  "mode": self.mode.get(), "single": self.single.get(), "crop_mode": self.crop_mode.get()})
+                  "mode": self.mode.get(), "single": self.single.get(), "crop_mode": self.crop_mode.get(),
+                  "ignore": self.ignore.get()})
 
     def on_close(self):
         self.save_settings()
@@ -390,7 +413,7 @@ class App:
         self.save_settings()
         cfg = {"url": url, "fmt": self.fmt.get(), "quality": self.quality.get(),
                "full": self.mode.get() == "full", "single": self.single.get(),
-               "outdir": self.outdir.get(), "crop": self.crop(),
+               "outdir": self.outdir.get(), "crop": self.crop(), "words": parse_words(self.ignore.get()),
                "cover_img": self.pv_img if self.pv_url == url else None}
         self.cancel.clear()
         self.bar["value"] = 0
@@ -403,6 +426,7 @@ class App:
         try:
             put(("status", "Lendo o link…"))
             is_pl, album, entries, urls, _ = probe(c["url"], c["single"])
+            album = clean(album, c["words"]) if album else album
             outdir = os.path.join(c["outdir"], sanitize_filename(album)) if is_pl else c["outdir"]
             os.makedirs(outdir, exist_ok=True)
 
@@ -420,11 +444,11 @@ class App:
                 url = e.get("url") or f"https://www.youtube.com/watch?v={e.get('id')}"
                 put(("status", f"[{i}/{n}] {e.get('title') or url}"))
                 try:
-                    path, vinfo = self.download(url, c, outdir, f"{i:02d} - " if is_pl else "", i, n)
+                    path, vinfo = self.download(url, c, outdir, f"{i:02d} - " if is_pl else "", i, n, e.get("title"))
                     if c["full"]:
                         cv = cover or (None if is_pl else fetch_cover(
                             video_cover_urls(vinfo.get("id"), vinfo.get("thumbnails"))))
-                        tag_file(path, c["fmt"], build_meta(vinfo, album, i if is_pl else None, n), cv)
+                        tag_file(path, c["fmt"], build_meta(vinfo, album, i if is_pl else None, n, c["words"]), cv)
                     ok += 1
                     put(("log", f"✔ {os.path.basename(path)}"))
                 except DownloadCancelled:
@@ -441,7 +465,7 @@ class App:
             put(("log", f"Erro: {ex}"))
             put(("done", "Erro ao processar o link."))
 
-    def download(self, url, c, outdir, prefix, i, n):
+    def download(self, url, c, outdir, prefix, i, n, title=None):
         put, cur = self.q.put, [0.0]
 
         def hook(d):
@@ -453,7 +477,8 @@ class App:
                 cur[0] = max(cur[0], frac * 0.9)
                 put(("progress", ((i - 1) + cur[0]) / n * 100))
 
-        tmpl = os.path.join(outdir, prefix).replace("%", "%%") + "%(title)s.%(ext)s"
+        name = sanitize_filename(clean(title, c["words"])) if (title and c["words"]) else ""
+        tmpl = os.path.join(outdir, prefix).replace("%", "%%") + (name.replace("%", "%%") or "%(title)s") + ".%(ext)s"
         o = {"outtmpl": tmpl, "quiet": True, "no_warnings": True, "noplaylist": True,
              "progress_hooks": [hook], "logger": QuietLogger(self.q)}
         if c["fmt"] == "MP3":

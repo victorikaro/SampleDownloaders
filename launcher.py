@@ -17,7 +17,7 @@ import sys
 import urllib.request
 
 # >>> EDITE AQUI (repositório PÚBLICO onde está o baixador_youtube.py) <<<
-REPO = "victorikaro/SampleDownloader"
+REPO = "victorikaro/SampleDownloaders"
 BRANCH = "main"
 APP_FILE = "baixador_youtube.py"
 
