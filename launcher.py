@@ -17,7 +17,7 @@ import sys
 import urllib.request
 
 # >>> EDITE AQUI (repositório PÚBLICO onde está o baixador_youtube.py) <<<
-REPO = "victorikaro/SampleDownloaders"
+REPO = "SEU_USUARIO/SEU_REPOSITORIO"
 BRANCH = "main"
 APP_FILE = "baixador_youtube.py"
 
@@ -33,7 +33,7 @@ def _deps():
     """Nunca é chamada: só avisa o PyInstaller de quais bibliotecas embutir no .exe."""
     import io, queue, threading, urllib.request  # noqa
     import tkinter, tkinter.ttk, tkinter.filedialog, tkinter.messagebox  # noqa
-    import mutagen.id3, mutagen.mp4  # noqa
+    import mutagen.id3, mutagen.mp4, mutagen.flac  # noqa
     import PIL.Image, PIL.ImageTk  # noqa
 
 
@@ -71,6 +71,23 @@ def update_ytdlp(notes):
         pass
 
 
+def ensure_ffmpeg(label, splash):
+    """Windows: baixa o ffmpeg sozinho na primeira vez (fica em pasta BaixadorYT no APPDATA)."""
+    if shutil.which("ffmpeg") or os.name != "nt":
+        return
+    try:
+        import io, zipfile
+        label.config(text="Baixando o ffmpeg (só na primeira vez, ~80 MB)…")
+        splash.update()
+        z = zipfile.ZipFile(io.BytesIO(get("https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip", timeout=600)))
+        for n in z.namelist():
+            if n.endswith(("/bin/ffmpeg.exe", "/bin/ffprobe.exe")):
+                with open(os.path.join(HOME, os.path.basename(n)), "wb") as f:
+                    f.write(z.read(n))
+    except Exception:
+        pass
+
+
 def main():
     os.makedirs(HOME, exist_ok=True)
     os.environ["PATH"] = os.pathsep.join([BASE, HOME, os.environ.get("PATH", "")])  # ffmpeg.exe ao lado do programa
@@ -79,7 +96,11 @@ def main():
     import tkinter as tk
     splash = tk.Tk()
     splash.title("Baixador YouTube")
-    tk.Label(splash, text="Verificando atualizações…", padx=40, pady=24).pack()
+    lbl = tk.Label(splash, text="Verificando atualizações…", padx=40, pady=24)
+    lbl.pack()
+    splash.update()
+    ensure_ffmpeg(lbl, splash)
+    lbl.config(text="Verificando atualizações…")
     splash.update()
 
     if not os.path.exists(APP_PATH):  # primeira vez / sem internet: usa a cópia embutida

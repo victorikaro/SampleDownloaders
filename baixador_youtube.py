@@ -6,7 +6,7 @@ Rodar direto:  pip install -U yt-dlp mutagen pillow   ->   python baixador_youtu
 Precisa do ffmpeg (no PATH ou ffmpeg.exe ao lado do programa).
 Para virar .exe com atualização automática, veja launcher.py e build_exe.bat.
 """
-APP_VERSION = "1.2.0"
+APP_VERSION = "2.0.0"
 
 import io
 import json
@@ -16,6 +16,8 @@ import re
 import shutil
 import sys
 import threading
+import subprocess
+import urllib.parse
 import urllib.request
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -25,6 +27,7 @@ try:
     from yt_dlp.utils import DownloadCancelled, sanitize_filename
     from mutagen.id3 import APIC, ID3, TALB, TDRC, TIT2, TPE1, TPE2, TRCK, ID3NoHeaderError
     from mutagen.mp4 import MP4, MP4Cover
+    from mutagen.flac import FLAC, Picture
     from PIL import Image, ImageTk
 except ImportError:
     sys.exit("Faltam dependências. Rode: pip install -U yt-dlp mutagen pillow")
@@ -32,6 +35,8 @@ except ImportError:
 PW, PH = 320, 180  # tamanho da prévia
 HOME = os.path.join(os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config"), "BaixadorYT")
 CFG = os.path.join(HOME, "config.json")
+ARCHIVE = os.path.join(HOME, "baixados.txt")
+BROWSER = [None]  # navegador para cookies (None = nenhum)
 
 
 # ---------- configurações salvas ----------
@@ -97,7 +102,40 @@ def cover_jpeg(img, crop):
     return buf.getvalue(), "image/jpeg"
 
 
+def itunes_cover(artist, title):
+    """Capa oficial do álbum (iTunes Search, sem chave). Só aceita se o nome da música bater."""
+    try:
+        q = urllib.parse.quote(f"{artist} {title}")
+        r = json.loads(urllib.request.urlopen(f"https://itunes.apple.com/search?term={q}&entity=song&limit=1", timeout=10).read())["results"][0]
+        if title.lower()[:6] not in r["trackName"].lower():
+            return None
+        return fetch_cover([r["artworkUrl100"].replace("100x100bb", "1000x1000bb")])
+    except Exception:
+        return None
+
+
+def load_archive():
+    try:
+        with open(ARCHIVE, encoding="utf-8") as f:
+            return set(f.read().split())
+    except Exception:
+        return set()
+
+
+def append_archive(key):
+    try:
+        os.makedirs(HOME, exist_ok=True)
+        with open(ARCHIVE, "a", encoding="utf-8") as f:
+            f.write(key + "\n")
+    except Exception:
+        pass
+
+
 # ---------- textos ignorados ----------
+_KW = r"(?:official|oficial|music|lyrics?|letra|v[ií]deo|videoclipe|clipe|[aá]udio|visuali[sz]er|hd|hq|4k|with)"
+AUTO_RE = re.compile(r"[\(\[]\s*(?:" + _KW + r"\b[\s,/&+-]*)+[\)\]]", re.IGNORECASE)
+
+
 def parse_words(text):
     return [w.strip() for w in re.split(r"[,\n]", text) if w.strip()]
 
@@ -107,7 +145,10 @@ def clean(text, words):
     if not words or not text:
         return text
     for w in words:
-        text = re.sub(re.escape(w), "", text, flags=re.IGNORECASE)
+        if isinstance(w, re.Pattern):
+            text = w.sub("", text)
+        else:
+            text = re.sub(re.escape(w), "", text, flags=re.IGNORECASE)
     text = re.sub(r"\(\s*\)|\[\s*\]|\{\s*\}", "", text)          # parênteses vazios
     text = re.sub(r"(\s[-–—|]\s*){2,}", " - ", text)               # separadores duplicados
     text = re.sub(r"\s{2,}", " ", text)
@@ -118,6 +159,8 @@ def clean(text, words):
 def probe(url, single):
     """Lê o link sem baixar. Retorna (é_playlist, álbum, entradas, urls_da_capa, info)."""
     opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "noplaylist": single}
+    if BROWSER[0]:
+        opts["cookiesfrombrowser"] = (BROWSER[0],)
     with yt_dlp.YoutubeDL(opts) as y:
         info = y.extract_info(url, download=False)
     if info.get("_type") == "playlist":
@@ -130,7 +173,7 @@ def probe(url, single):
     return False, None, [{"url": url, "id": info.get("id"), "title": info.get("title")}], urls, info
 
 
-def build_meta(info, album, idx, total, words=()):
+def build_meta(info, album, idx, total, words=(), over=None):
     title = clean(info.get("track") or info.get("title") or "", words)
     artist = info.get("artist") or info.get("creator")
     if isinstance(artist, (list, tuple)):
@@ -141,8 +184,10 @@ def build_meta(info, album, idx, total, words=()):
         else:
             artist = info.get("channel") or info.get("uploader") or ""
     artist = clean(re.sub(r"\s*-\s*Topic$", "", artist), words)
-    return {"title": title, "artist": artist, "album": clean(album or info.get("album") or title, words),
+    m = {"title": title, "artist": artist, "album": clean(album or info.get("album") or title, words),
             "year": (info.get("upload_date") or "")[:4], "idx": idx, "total": total}
+    m.update({k: v for k, v in (over or {}).items() if v})
+    return m
 
 
 def tag_file(path, fmt, m, cover):
@@ -163,6 +208,18 @@ def tag_file(path, fmt, m, cover):
         if data:
             t.add(APIC(encoding=3, mime=mime, type=3, desc="Capa", data=data))
         t.save(path, v2_version=3)
+    elif fmt == "FLAC":
+        f = FLAC(path)
+        f["title"], f["artist"], f["album"] = m["title"], m["artist"], m["album"]
+        if m["year"]:
+            f["date"] = m["year"]
+        if m["idx"]:
+            f["tracknumber"] = str(m["idx"])
+        if data:
+            pic = Picture()
+            pic.type, pic.mime, pic.data = 3, mime, data
+            f.add_picture(pic)
+        f.save()
     else:
         f = MP4(path)
         f["\xa9nam"], f["\xa9ART"], f["aART"] = [m["title"]], [m["artist"]], [m["artist"]]
@@ -194,7 +251,7 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title(f"Baixador YouTube – MP3 / MP4  (v{APP_VERSION})")
-        root.geometry("800x660")
+        root.geometry("840x830")
         self.q = queue.Queue()
         self.cancel = threading.Event()
         self.cx = self.cy = 0.5
@@ -209,6 +266,13 @@ class App:
         self.crop_mode = tk.StringVar(value=s.get("crop_mode", "square"))
         self.zoom = tk.DoubleVar(value=1.0)
         self.ignore = tk.StringVar(value=s.get("ignore", ""))
+        self.auto = tk.BooleanVar(value=s.get("auto", True))
+        self.m_title, self.m_artist, self.m_album = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        self.skip = tk.BooleanVar(value=s.get("skip", True))
+        self.norm = tk.BooleanVar(value=s.get("norm", False))
+        self.itunes = tk.BooleanVar(value=s.get("itunes", False))
+        self.dark = tk.BooleanVar(value=s.get("dark", False))
+        self.cookies = tk.StringVar(value=s.get("cookies", "Nenhum"))
         self.outdir = tk.StringVar(value=s.get("outdir") or os.path.join(os.path.expanduser("~"), "Downloads"))
         self.status = tk.StringVar(value=os.environ.get("BYT_NOTE") or "Pronto.")
 
@@ -220,12 +284,17 @@ class App:
         ttk.Entry(row, textvariable=self.url).pack(side="left", fill="x", expand=True)
         ttk.Button(row, text="Colar", command=self.paste).pack(side="left", padx=(6, 0))
 
+        ttk.Label(p, text="Mais links (um por linha) – entram na fila depois do primeiro:").pack(anchor="w")
+        self.extra = tk.Text(p, height=2)
+        self.extra.pack(fill="x", pady=(2, 8))
+
         mid = ttk.Frame(p); mid.pack(fill="x")
         left = ttk.Frame(mid); left.pack(side="left", fill="both", expand=True)
 
         f1 = ttk.LabelFrame(left, text="Formato", padding=8); f1.pack(fill="x")
-        for t in ("MP3", "MP4"):
-            ttk.Radiobutton(f1, text=t, value=t, variable=self.fmt, command=self.on_fmt).pack(anchor="w")
+        rf = ttk.Frame(f1); rf.pack(anchor="w")
+        for t in ("MP3", "M4A", "FLAC", "MP4"):
+            ttk.Radiobutton(rf, text=t, value=t, variable=self.fmt, command=self.on_fmt).pack(side="left", padx=(0, 6))
         ttk.Label(f1, text="Qualidade (kbps / altura):").pack(anchor="w", pady=(6, 0))
         self.cb = ttk.Combobox(f1, textvariable=self.quality, state="readonly", width=10)
         self.cb.pack(anchor="w")
@@ -251,9 +320,35 @@ class App:
         ttk.Scale(r, from_=0.4, to=1.0, variable=self.zoom, command=lambda _v: self.draw()).pack(side="left", fill="x", expand=True, padx=6)
         ttk.Label(right, text="Arraste sobre a imagem para posicionar o corte.", foreground="#666").pack(anchor="w")
 
-        ttk.Label(p, text="Ignorar textos no nome do arquivo e nos metadados (separe por vírgula):").pack(anchor="w", pady=(10, 0))
-        ttk.Entry(p, textvariable=self.ignore).pack(fill="x", pady=2)
-        ttk.Label(p, text="Ex.: [Official Audio], (Official Video), (Lyrics)", foreground="#666").pack(anchor="w")
+        nb = ttk.Notebook(p); nb.pack(fill="x", pady=(10, 0))
+        t1, t2, t3 = (ttk.Frame(nb, padding=8) for _ in range(3))
+        nb.add(t1, text="Metadados e faixas"); nb.add(t2, text="Limpar nomes"); nb.add(t3, text="Avançado")
+
+        e = ttk.Frame(t1); e.pack(side="left", fill="x", expand=True)
+        for i, (lbl, var) in enumerate((("Título (vídeo único)", self.m_title), ("Artista", self.m_artist), ("Álbum", self.m_album))):
+            ttk.Label(e, text=lbl).grid(row=i, column=0, sticky="w", pady=2)
+            ttk.Entry(e, textvariable=var).grid(row=i, column=1, sticky="ew", padx=6)
+        e.columnconfigure(1, weight=1)
+        ttk.Label(e, text="Preenchido pela prévia; edite à vontade. Vale para o 1º link.", foreground="#777").grid(row=3, column=0, columnspan=2, sticky="w")
+        tr = ttk.Frame(t1); tr.pack(side="left", padx=(10, 0))
+        ttk.Label(tr, text="Faixas da playlist (nada marcado = todas):").pack(anchor="w")
+        self.tracks = tk.Listbox(tr, selectmode="extended", height=5, width=46, exportselection=False)
+        self.tracks.pack()
+
+        ttk.Checkbutton(t2, text="Remover automaticamente (Official Video), [Official Audio], (Lyrics), (Áudio Oficial), (HD)…",
+                        variable=self.auto).pack(anchor="w")
+        ttk.Label(t2, text="Outros textos para ignorar (separe por vírgula):").pack(anchor="w", pady=(6, 0))
+        ttk.Entry(t2, textvariable=self.ignore).pack(fill="x", pady=2)
+
+        for txt, var in (("Pular o que já foi baixado antes (desmarque para baixar de novo)", self.skip),
+                         ("Normalizar o volume (só áudio)", self.norm),
+                         ("Usar capa oficial do álbum (iTunes) em vídeo único, se encontrar", self.itunes),
+                         ("Tema escuro", self.dark)):
+            ttk.Checkbutton(t3, text=txt, variable=var, command=self.apply_theme).pack(anchor="w")
+        r = ttk.Frame(t3); r.pack(anchor="w", pady=(4, 0))
+        ttk.Label(r, text="Usar cookies do navegador (vídeos restritos):").pack(side="left")
+        ttk.Combobox(r, textvariable=self.cookies, values=("Nenhum", "chrome", "edge", "firefox", "brave", "opera"),
+                     state="readonly", width=10).pack(side="left", padx=6)
 
         ttk.Label(p, text="Salvar em:").pack(anchor="w", pady=(10, 0))
         row = ttk.Frame(p); row.pack(fill="x", pady=2)
@@ -264,34 +359,40 @@ class App:
         self.btn_go = ttk.Button(row, text="Baixar", command=self.start); self.btn_go.pack(side="left")
         self.btn_stop = ttk.Button(row, text="Cancelar", command=self.cancel.set, state="disabled")
         self.btn_stop.pack(side="left", padx=6)
+        ttk.Button(row, text="Abrir pasta", command=self.open_dir).pack(side="left")
 
         self.bar = ttk.Progressbar(p, maximum=100); self.bar.pack(fill="x")
         ttk.Label(p, textvariable=self.status).pack(anchor="w", pady=(4, 6))
-        self.log = tk.Text(p, height=8, state="disabled", wrap="word")
+        self.log = tk.Text(p, height=6, state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True)
 
         self.url.trace_add("write", self.url_changed)
         self.single.trace_add("write", lambda *_: (setattr(self, "pv_url", None), self.url_changed()))
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.draw()
+        self.last_clip = ""
+        self.apply_theme()
         root.after(100, self.poll)
+        root.after(1000, self.clip_poll)
 
     # --- configurações ---
     def save_settings(self):
         save_cfg({"outdir": self.outdir.get(), "fmt": self.fmt.get(), "quality": self.quality.get(),
                   "mode": self.mode.get(), "single": self.single.get(), "crop_mode": self.crop_mode.get(),
-                  "ignore": self.ignore.get()})
+                  "ignore": self.ignore.get(), "auto": self.auto.get(), "skip": self.skip.get(),
+                  "norm": self.norm.get(), "itunes": self.itunes.get(), "dark": self.dark.get(),
+                  "cookies": self.cookies.get()})
 
     def on_close(self):
         self.save_settings()
         self.root.destroy()
 
     def set_quality_values(self, keep=False):
-        mp3 = self.fmt.get() == "MP3"
-        vals = ("128", "192", "256", "320") if mp3 else ("Melhor", "1080", "720", "480", "360")
+        f = self.fmt.get()
+        vals = {"MP4": ("Melhor", "1080", "720", "480", "360"), "FLAC": ("Sem perda",)}.get(f, ("128", "192", "256", "320"))
         self.cb["values"] = vals
         if not (keep and self.quality.get() in vals):
-            self.quality.set("192" if mp3 else "Melhor")
+            self.quality.set({"MP4": "Melhor", "FLAC": "Sem perda"}.get(f, "192"))
 
     def on_fmt(self):
         self.set_quality_values()
@@ -326,23 +427,30 @@ class App:
             return
         self.pv_url = url
         self.pv_title.config(text="Carregando prévia…")
-        threading.Thread(target=self.preview_worker, args=(url, self.single.get()), daemon=True).start()
+        BROWSER[0] = None if self.cookies.get() == "Nenhum" else self.cookies.get()
+        threading.Thread(target=self.preview_worker, args=(url, self.single.get(), self.words()), daemon=True).start()
 
-    def preview_worker(self, url, single):
+    def preview_worker(self, url, single, words):
         try:
             is_pl, album, entries, urls, info = probe(url, single)
             got = fetch_cover(urls)
             img = Image.open(io.BytesIO(got[0])).convert("RGB") if got else None
             title = f"Playlist: {album} ({len(entries)} faixas)" if is_pl else (info.get("title") or url)
-            self.q.put(("preview", (url, title, img)))
+            guess = {"album": clean(album, words)} if is_pl else build_meta(info, None, None, None, words)
+            self.q.put(("preview", (url, title, img, [e.get("title") or "?" for e in entries] if is_pl else [], guess)))
         except Exception as ex:
-            self.q.put(("preview", (url, f"Não foi possível carregar a prévia: {ex}", None)))
+            self.q.put(("preview", (url, f"Não foi possível carregar a prévia: {ex}", None, [], {})))
 
-    def set_preview(self, url, title, img):
+    def set_preview(self, url, title, img, tracks=(), guess=None):
         if url != self.pv_url:
             return
         self.pv_img, self.cx, self.cy = img, 0.5, 0.5
         self.pv_title.config(text=title)
+        self.tracks.delete(0, "end")
+        for i, t in enumerate(tracks, 1):
+            self.tracks.insert("end", f"{i:02d} - {t}")
+        g = guess or {}
+        self.m_title.set(g.get("title", "")); self.m_artist.set(g.get("artist", "")); self.m_album.set(g.get("album", ""))
         if img:
             k, _, _ = self.geom()
             self.pv_tk = ImageTk.PhotoImage(img.resize((max(1, int(img.width * k)), max(1, int(img.height * k)))))
@@ -380,6 +488,43 @@ class App:
             c.create_rectangle(*box, fill="black", stipple="gray50", outline="")
         c.create_rectangle(x0, y0, x1, y1, outline="white", width=2)
 
+    # --- extras ---
+    def words(self):
+        return ([AUTO_RE] if self.auto.get() else []) + parse_words(self.ignore.get())
+
+    def links(self):
+        return [self.url.get().strip()] + re.findall(r"https?://\S+", self.extra.get("1.0", "end"))
+
+    def clip_poll(self):
+        try:
+            t = self.root.clipboard_get().strip()
+        except tk.TclError:
+            t = ""
+        if t != self.last_clip:
+            self.last_clip = t
+            if re.match(r"https?://(www\.|m\.|music\.)?(youtube\.com|youtu\.be)/", t) and not self.url.get().strip():
+                self.url.set(t)
+        self.root.after(1000, self.clip_poll)
+
+    def apply_theme(self):
+        bg, fg, fld = ("#1e1e1e", "#e8e8e8", "#2b2b2b") if self.dark.get() else ("#f0f0f0", "#111111", "#ffffff")
+        st = ttk.Style()
+        st.theme_use("clam")
+        st.configure(".", background=bg, foreground=fg, fieldbackground=fld)
+        st.configure("TNotebook.Tab", background=fld, foreground=fg)
+        st.map("TCombobox", fieldbackground=[("readonly", fld)], foreground=[("readonly", fg)])
+        self.root.configure(bg=bg)
+        for w in (self.log, self.tracks, self.extra):
+            w.configure(bg=fld, fg=fg, insertbackground=fg)
+
+    def open_dir(self):
+        d = self.outdir.get()
+        os.makedirs(d, exist_ok=True)
+        if sys.platform.startswith("win"):
+            os.startfile(d)
+        else:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", d])
+
     # --- execução ---
     def poll(self):
         try:
@@ -397,6 +542,8 @@ class App:
                     self.btn_go.config(state="normal")
                     self.btn_stop.config(state="disabled")
                     self.status.set(v)
+                    self.root.bell()
+                    messagebox.showinfo("Baixador YouTube", v)
         except queue.Empty:
             pass
         self.root.after(100, self.poll)
@@ -411,9 +558,14 @@ class App:
                                  "Instale o ffmpeg ou coloque o ffmpeg.exe na mesma pasta do programa.")
             return
         self.save_settings()
+        BROWSER[0] = None if self.cookies.get() == "Nenhum" else self.cookies.get()
         cfg = {"url": url, "fmt": self.fmt.get(), "quality": self.quality.get(),
                "full": self.mode.get() == "full", "single": self.single.get(),
-               "outdir": self.outdir.get(), "crop": self.crop(), "words": parse_words(self.ignore.get()),
+               "outdir": self.outdir.get(), "crop": self.crop(), "words": self.words(), "links": self.links(),
+               "picks": list(self.tracks.curselection()) if self.pv_url == url else [],
+               "over": {"title": self.m_title.get().strip(), "artist": self.m_artist.get().strip(),
+                        "album": self.m_album.get().strip()} if self.pv_url == url else {},
+               "skip": self.skip.get(), "norm": self.norm.get(), "itunes": self.itunes.get(),
                "cover_img": self.pv_img if self.pv_url == url else None}
         self.cancel.clear()
         self.bar["value"] = 0
@@ -422,48 +574,64 @@ class App:
         threading.Thread(target=self.worker, args=(cfg,), daemon=True).start()
 
     def worker(self, c):
-        put = self.q.put
-        try:
-            put(("status", "Lendo o link…"))
-            is_pl, album, entries, urls, _ = probe(c["url"], c["single"])
-            album = clean(album, c["words"]) if album else album
-            outdir = os.path.join(c["outdir"], sanitize_filename(album)) if is_pl else c["outdir"]
-            os.makedirs(outdir, exist_ok=True)
-
-            cover = None
-            if c["full"]:
-                if c["cover_img"]:
-                    cover = cover_jpeg(c["cover_img"], c["crop"])  # capa já recortada na prévia
-                elif is_pl:
-                    cover = fetch_cover(urls)
-
-            n, ok = len(entries), 0
-            for i, e in enumerate(entries, 1):
-                if self.cancel.is_set():
-                    break
-                url = e.get("url") or f"https://www.youtube.com/watch?v={e.get('id')}"
-                put(("status", f"[{i}/{n}] {e.get('title') or url}"))
-                try:
-                    path, vinfo = self.download(url, c, outdir, f"{i:02d} - " if is_pl else "", i, n, e.get("title"))
-                    if c["full"]:
-                        cv = cover or (None if is_pl else fetch_cover(
-                            video_cover_urls(vinfo.get("id"), vinfo.get("thumbnails"))))
-                        tag_file(path, c["fmt"], build_meta(vinfo, album, i if is_pl else None, n, c["words"]), cv)
-                    ok += 1
-                    put(("log", f"✔ {os.path.basename(path)}"))
-                except DownloadCancelled:
-                    break
-                except Exception as ex:
-                    put(("log", f"✘ Falhou: {ex}"))
-                put(("progress", i / n * 100))
-
+        put, ok, tot, outdir = self.q.put, 0, 0, c["outdir"]
+        for k, link in enumerate(c["links"]):
             if self.cancel.is_set():
-                put(("done", f"Cancelado. {ok} de {n} concluído(s)."))
-            else:
-                put(("done", f"Concluído: {ok} de {n} em {outdir}"))
-        except Exception as ex:
-            put(("log", f"Erro: {ex}"))
-            put(("done", "Erro ao processar o link."))
+                break
+            try:
+                r = self.run_link(c, link, k == 0)
+                ok, tot, outdir = ok + r[0], tot + r[1], r[2]
+            except Exception as ex:
+                put(("log", f"Erro em {link}: {ex}"))
+        put(("done", ("Cancelado. " if self.cancel.is_set() else "Concluído: ") + f"{ok} de {tot} arquivo(s) em {outdir}"))
+
+    def run_link(self, c, link, first):
+        put, words = self.q.put, c["words"]
+        put(("status", f"Lendo o link… {link}"))
+        is_pl, album, entries, urls, _ = probe(link, c["single"])
+        over = {k: v for k, v in (c["over"] if first else {}).items() if not (is_pl and k == "title")}
+        album = clean(album, words) if album else album
+        outdir = os.path.join(c["outdir"], sanitize_filename(album)) if is_pl else c["outdir"]
+        os.makedirs(outdir, exist_ok=True)
+        if first and is_pl and c["picks"]:
+            entries = [entries[i] for i in c["picks"] if i < len(entries)]
+        done, cover = load_archive(), None
+        if c["full"]:
+            if first and c["cover_img"]:
+                cover = cover_jpeg(c["cover_img"], c["crop"])  # capa já recortada na prévia
+            elif is_pl:
+                cover = fetch_cover(urls)
+
+        n, ok = len(entries), 0
+        for i, e in enumerate(entries, 1):
+            if self.cancel.is_set():
+                break
+            vid = e.get("id")
+            key = f'{c["fmt"]}:{vid}' if vid else None
+            url = e.get("url") or f"https://www.youtube.com/watch?v={vid}"
+            if c["skip"] and key in done:
+                put(("log", f"↷ Já baixado: {e.get('title') or url}"))
+                continue
+            put(("status", f"[{i}/{n}] {e.get('title') or url}"))
+            try:
+                path, vinfo = self.download(url, c, outdir, f"{i:02d} - " if is_pl else "", i, n,
+                                            over.get("title") or e.get("title"))
+                if c["full"]:
+                    m = build_meta(vinfo, album, i if is_pl else None, n, words, over)
+                    cv = cover or (None if is_pl else fetch_cover(video_cover_urls(vinfo.get("id"), vinfo.get("thumbnails"))))
+                    if c["itunes"] and not is_pl:
+                        cv = itunes_cover(m["artist"], m["title"]) or cv
+                    tag_file(path, c["fmt"], m, cv)
+                ok += 1
+                if key:
+                    append_archive(key)
+                put(("log", f"✔ {os.path.basename(path)}"))
+            except DownloadCancelled:
+                break
+            except Exception as ex:
+                put(("log", f"✘ Falhou: {ex}"))
+            put(("progress", i / n * 100))
+        return ok, n, outdir
 
     def download(self, url, c, outdir, prefix, i, n, title=None):
         put, cur = self.q.put, [0.0]
@@ -477,14 +645,20 @@ class App:
                 cur[0] = max(cur[0], frac * 0.9)
                 put(("progress", ((i - 1) + cur[0]) / n * 100))
 
-        name = sanitize_filename(clean(title, c["words"])) if (title and c["words"]) else ""
+        name = sanitize_filename(clean(title, c["words"])) if title else ""
         tmpl = os.path.join(outdir, prefix).replace("%", "%%") + (name.replace("%", "%%") or "%(title)s") + ".%(ext)s"
         o = {"outtmpl": tmpl, "quiet": True, "no_warnings": True, "noplaylist": True,
              "progress_hooks": [hook], "logger": QuietLogger(self.q)}
-        if c["fmt"] == "MP3":
-            o["format"] = "bestaudio/best"
-            o["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
-                                    "preferredquality": c["quality"]}]
+        if BROWSER[0]:
+            o["cookiesfrombrowser"] = (BROWSER[0],)
+        if c["fmt"] != "MP4":
+            codec = c["fmt"].lower()  # mp3 / m4a / flac
+            pp = {"key": "FFmpegExtractAudio", "preferredcodec": codec}
+            if codec != "flac":
+                pp["preferredquality"] = c["quality"]
+            o["format"], o["postprocessors"] = "bestaudio/best", [pp]
+            if c["norm"]:
+                o["postprocessor_args"] = {"extractaudio": ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"]}
         else:
             h = "" if c["quality"] == "Melhor" else f"[height<={c['quality']}]"
             o["format"] = f"bestvideo{h}[ext=mp4]+bestaudio[ext=m4a]/bestvideo{h}+bestaudio/best{h}"
@@ -495,7 +669,7 @@ class App:
             path = ((vinfo.get("requested_downloads") or [{}])[0]).get("filepath")
             if not path or not os.path.exists(path):
                 base = os.path.splitext(ydl.prepare_filename(vinfo))[0]
-                path = base + (".mp3" if c["fmt"] == "MP3" else ".mp4")
+                path = base + "." + c["fmt"].lower()
         return path, vinfo
 
 
