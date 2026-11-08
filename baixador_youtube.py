@@ -6,7 +6,11 @@ Rodar direto:  pip install -U yt-dlp mutagen pillow   ->   python baixador_youtu
 Precisa do ffmpeg (no PATH ou ffmpeg.exe ao lado do programa).
 Para virar .exe com atualização automática, veja launcher.py e build_exe.bat.
 """
-APP_VERSION = "2.0.1"
+# Versão = MAIOR.MENOR.CORREÇÃO
+#   CORREÇÃO (2.0.2 -> 2.0.3): conserta erro / ajuste pequeno
+#   MENOR    (2.0.3 -> 2.1.0): função nova (o .exe atual continua servindo)
+#   MAIOR    (2.x.x -> 3.0.0): mudança grande / biblioteca nova -> precisa refazer o .exe
+APP_VERSION = "2.0.3"
 
 import io
 import json
@@ -251,7 +255,7 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title(f"Baixador YouTube – MP3 / MP4  (v{APP_VERSION})")
-        root.geometry("840x830")
+        root.geometry(f"840x{min(830, max(500, root.winfo_screenheight() - 90))}")  # cabe em telas menores
         self.q = queue.Queue()
         self.cancel = threading.Event()
         self.cx = self.cy = 0.5
@@ -278,6 +282,10 @@ class App:
 
         p = ttk.Frame(root, padding=14)
         p.pack(fill="both", expand=True)
+
+        # Botões, barra e status ficam presos embaixo (empacotados primeiro): nunca somem, mesmo com janela pequena.
+        bottom = ttk.Frame(p)
+        bottom.pack(side="bottom", fill="x")
 
         ttk.Label(p, text="Link do vídeo ou playlist:").pack(anchor="w")
         row = ttk.Frame(p); row.pack(fill="x", pady=(2, 10))
@@ -355,16 +363,16 @@ class App:
         ttk.Entry(row, textvariable=self.outdir).pack(side="left", fill="x", expand=True)
         ttk.Button(row, text="Escolher…", command=self.pick_dir).pack(side="left", padx=(6, 0))
 
-        row = ttk.Frame(p); row.pack(fill="x", pady=10)
+        row = ttk.Frame(bottom); row.pack(fill="x", pady=(10, 6))
         self.btn_go = ttk.Button(row, text="Baixar", command=self.start); self.btn_go.pack(side="left")
         self.btn_stop = ttk.Button(row, text="Cancelar", command=self.cancel.set, state="disabled")
         self.btn_stop.pack(side="left", padx=6)
         ttk.Button(row, text="Abrir pasta", command=self.open_dir).pack(side="left")
 
-        self.bar = ttk.Progressbar(p, maximum=100); self.bar.pack(fill="x")
-        ttk.Label(p, textvariable=self.status).pack(anchor="w", pady=(4, 6))
+        self.bar = ttk.Progressbar(bottom, maximum=100); self.bar.pack(fill="x")
+        ttk.Label(bottom, textvariable=self.status).pack(anchor="w", pady=(4, 0))
         self.log = tk.Text(p, height=6, state="disabled", wrap="word")
-        self.log.pack(fill="both", expand=True)
+        self.log.pack(side="bottom", fill="both", expand=True, pady=(6, 0))
 
         self.url.trace_add("write", self.url_changed)
         self.single.trace_add("write", lambda *_: (setattr(self, "pv_url", None), self.url_changed()))
