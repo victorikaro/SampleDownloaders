@@ -10,7 +10,7 @@ Para virar .exe com atualização automática, veja launcher.py e build_exe.bat.
 #   CORREÇÃO (2.0.2 -> 2.0.3): conserta erro / ajuste pequeno
 #   MENOR    (2.0.3 -> 2.1.0): função nova (o .exe atual continua servindo)
 #   MAIOR    (2.x.x -> 3.0.0): mudança grande / biblioteca nova -> precisa refazer o .exe
-APP_VERSION = "2.0.5"
+APP_VERSION = "2.0.6"
 
 import io
 import json
@@ -210,13 +210,33 @@ def clean(text, words):
 
 
 # ---------- YouTube / metadados ----------
-def probe(url, single):
+COOKIE_BAD = set()  # navegadores cujos cookies não deu para ler nesta rodada
+COOKIE_FAIL = re.compile(r"Could not copy|cookie database|decrypt|DPAPI|locked", re.IGNORECASE)
+
+
+def run_with_cookies(opts, say, fn):
+    """Roda fn(opts) com os cookies do navegador; se não der para ler (ex.: Chrome aberto), avisa e segue sem eles."""
+    b = BROWSER[0]
+    if b and b not in COOKIE_BAD:
+        try:
+            return fn({**opts, "cookiesfrombrowser": (b,)})
+        except Exception as ex:
+            if not COOKIE_FAIL.search(str(ex)):
+                raise
+            COOKIE_BAD.add(b)
+            say(f"⚠ Não consegui ler os cookies do {b} (feche o navegador por completo ou use o Firefox). "
+                "Continuando sem cookies.")
+    return fn(opts)
+
+
+def probe(url, single, say=lambda m: None):
     """Lê o link sem baixar. Retorna (é_playlist, álbum, entradas, urls_da_capa, info)."""
     opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "noplaylist": single}
-    if BROWSER[0]:
-        opts["cookiesfrombrowser"] = (BROWSER[0],)
-    with yt_dlp.YoutubeDL(opts) as y:
-        info = y.extract_info(url, download=False)
+
+    def go(o):
+        with yt_dlp.YoutubeDL(o) as y:
+            return y.extract_info(url, download=False)
+    info = run_with_cookies(opts, say, go)
     if info.get("_type") == "playlist":
         entries = [e for e in (info.get("entries") or []) if e]
         urls = thumb_urls(info.get("thumbnails"))
@@ -521,7 +541,7 @@ class App:
 
     def preview_worker(self, url, single, words):
         try:
-            is_pl, album, entries, urls, info = probe(url, single)
+            is_pl, album, entries, urls, info = probe(url, single, lambda m: self.q.put(("log", m)))
             got = fetch_cover(urls)
             img = Image.open(io.BytesIO(got[0])).convert("RGB") if got else None
             title = f"Playlist: {album} ({len(entries)} faixas)" if is_pl else (info.get("title") or url)
@@ -650,6 +670,7 @@ class App:
             return
         self.save_settings()
         BROWSER[0] = None if self.cookies.get() == "Nenhum" else self.cookies.get()
+        COOKIE_BAD.clear()  # tenta os cookies de novo a cada clique (o Chrome pode ter sido fechado)
         cfg = {"url": url, "fmt": self.fmt.get(), "quality": self.quality.get(),
                "full": self.mode.get() == "full", "single": self.single.get(),
                "outdir": self.outdir.get(), "crop": self.crop(), "words": self.words(), "links": self.links(),
@@ -682,7 +703,7 @@ class App:
     def run_link(self, c, link, first):
         put, words = self.q.put, c["words"]
         put(("status", f"Lendo o link… {link}"))
-        is_pl, album, entries, urls, _ = probe(link, c["single"])
+        is_pl, album, entries, urls, _ = probe(link, c["single"], lambda m: put(("log", m)))
         over = {k: v for k, v in (c["over"] if first else {}).items() if not (is_pl and k == "title")}
         album = clean(album, words) if album else album
         outdir = os.path.join(c["outdir"], sanitize_filename(album)) if is_pl else c["outdir"]
@@ -745,8 +766,6 @@ class App:
         tmpl = os.path.join(outdir, prefix).replace("%", "%%") + (name.replace("%", "%%") or "%(title)s") + ".%(ext)s"
         o = {"outtmpl": tmpl, "quiet": True, "no_warnings": False, "noplaylist": True,
              "progress_hooks": [hook], "logger": QuietLogger(self.q)}
-        if BROWSER[0]:
-            o["cookiesfrombrowser"] = (BROWSER[0],)
         if c["fmt"] != "MP4":
             codec = c["fmt"].lower()  # mp3 / m4a / flac
             pp = {"key": "FFmpegExtractAudio", "preferredcodec": codec}
@@ -760,13 +779,15 @@ class App:
             o["format"] = f"bestvideo{h}[ext=mp4]+bestaudio[ext=m4a]/bestvideo{h}+bestaudio/best{h}"
             o["merge_output_format"] = "mp4"
 
-        with yt_dlp.YoutubeDL(o) as ydl:
-            vinfo = ydl.extract_info(url, download=True)
-            path = ((vinfo.get("requested_downloads") or [{}])[0]).get("filepath")
-            if not path or not os.path.exists(path):
-                base = os.path.splitext(ydl.prepare_filename(vinfo))[0]
-                path = base + "." + c["fmt"].lower()
-        return path, vinfo
+        def go(opts):
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                vinfo = ydl.extract_info(url, download=True)
+                path = ((vinfo.get("requested_downloads") or [{}])[0]).get("filepath")
+                if not path or not os.path.exists(path):
+                    base = os.path.splitext(ydl.prepare_filename(vinfo))[0]
+                    path = base + "." + c["fmt"].lower()
+            return path, vinfo
+        return run_with_cookies(o, lambda m: put(("log", m)), go)
 
 
 if __name__ == "__main__":
