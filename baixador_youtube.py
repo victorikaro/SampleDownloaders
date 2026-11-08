@@ -10,7 +10,7 @@ Para virar .exe com atualização automática, veja launcher.py e build_exe.bat.
 #   CORREÇÃO (2.0.2 -> 2.0.3): conserta erro / ajuste pequeno
 #   MENOR    (2.0.3 -> 2.1.0): função nova (o .exe atual continua servindo)
 #   MAIOR    (2.x.x -> 3.0.0): mudança grande / biblioteca nova -> precisa refazer o .exe
-APP_VERSION = "2.0.4"
+APP_VERSION = "2.0.5"
 
 import io
 import json
@@ -41,6 +41,8 @@ HOME = os.path.join(os.environ.get("APPDATA") or os.path.join(os.path.expanduser
 CFG = os.path.join(HOME, "config.json")
 ARCHIVE = os.path.join(HOME, "baixados.txt")
 BROWSER = [None]  # navegador para cookies (None = nenhum)
+NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+os.environ["PATH"] = os.pathsep.join([HOME, os.environ.get("PATH", "")])  # deno.exe / ffmpeg.exe baixados ficam aqui
 
 
 # ---------- configurações salvas ----------
@@ -133,6 +135,54 @@ def append_archive(key):
             f.write(key + "\n")
     except Exception:
         pass
+
+
+# ---------- Deno (o yt-dlp exige um executor de JavaScript para o YouTube) ----------
+def deno_ok():
+    exe = shutil.which("deno")
+    if not exe:
+        return False
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=20, creationflags=NOWIN).stdout
+        m = re.search(r"deno (\d+)\.(\d+)", out)
+        return bool(m) and (int(m.group(1)), int(m.group(2))) >= (2, 3)
+    except Exception:
+        return False
+
+
+def ensure_deno(say):
+    """Windows: baixa o Deno sozinho na primeira vez (fica na pasta BaixadorYT). Retorna True se estiver pronto."""
+    if deno_ok():
+        return True
+    if os.name != "nt":
+        say("Falta o Deno (versão 2.3 ou maior), que o yt-dlp exige para o YouTube. Instale em https://deno.com")
+        return False
+    try:
+        import zipfile
+        arch = "aarch64" if os.environ.get("PROCESSOR_ARCHITECTURE", "").lower() == "arm64" else "x86_64"
+        say("Baixando o Deno (só na primeira vez, ~40 MB)…")
+        req = urllib.request.Request(
+            f"https://github.com/denoland/deno/releases/latest/download/deno-{arch}-pc-windows-msvc.zip",
+            headers={"User-Agent": "BaixadorYT"})
+        z = zipfile.ZipFile(io.BytesIO(urllib.request.urlopen(req, timeout=300).read()))
+        os.makedirs(HOME, exist_ok=True)
+        with open(os.path.join(HOME, "deno.exe"), "wb") as f:
+            f.write(z.read("deno.exe"))
+    except Exception as ex:
+        say(f"Não consegui baixar o Deno ({ex}). Instale manualmente em https://deno.com")
+        return False
+    return deno_ok()
+
+
+def hint(msg):
+    m = str(msg)
+    if "Requested format is not available" in m:
+        return ("Dica: costuma ser o YouTube sem liberar os formatos (falta do Deno, ou bloqueio). "
+                "Tente de novo e, se persistir, use cookies na aba Avançado.")
+    if "Sign in to confirm" in m or "not a bot" in m:
+        return ("Dica: aba Avançado → 'Usar cookies do navegador' (o navegador em que você está logado no YouTube; "
+                "se der erro com Chrome/Edge, tente Firefox).")
+    return ""
 
 
 # ---------- textos ignorados ----------
@@ -244,7 +294,9 @@ class QuietLogger:
 
     def debug(self, msg): pass
     def info(self, msg): pass
-    def warning(self, msg): pass
+    def warning(self, msg):  # só repassa os avisos que explicam por que o YouTube falhou
+        if re.search(r"JavaScript|runtime|challenge|SABR|sign in|signature|format", str(msg), re.IGNORECASE):
+            self.q.put(("log", "⚠ " + str(msg)))
 
     def error(self, msg):
         self.q.put(("log", str(msg)))
@@ -258,6 +310,7 @@ class App:
         root.geometry(f"840x{min(830, max(500, root.winfo_screenheight() - 90))}")  # cabe em telas menores
         self.q = queue.Queue()
         self.cancel = threading.Event()
+        self.ready = threading.Event()  # fica "ligado" quando o Deno está pronto
         self.cx = self.cy = 0.5
         self.pv_url = self.pv_img = self.pv_tk = self._after = None
 
@@ -339,8 +392,9 @@ class App:
         ttk.Scale(r, from_=0.4, to=1.0, variable=self.zoom, command=lambda _v: self.draw()).pack(side="left", fill="x", expand=True, padx=6)
         ttk.Label(right, text="Arraste sobre a imagem para posicionar o corte.", foreground="#666").pack(anchor="w")
 
-        nb = ttk.Notebook(p); nb.pack(fill="x", pady=(10, 0))
+        self.nb = nb = ttk.Notebook(p); nb.pack(fill="x", pady=(10, 0))
         t1, t2, t3 = (ttk.Frame(nb, padding=8) for _ in range(3))
+        self.tabs = (t1, t2, t3)
         nb.add(t1, text="Metadados e faixas"); nb.add(t2, text="Limpar nomes"); nb.add(t3, text="Avançado")
 
         e = ttk.Frame(t1); e.pack(side="left", fill="x", expand=True)
@@ -393,6 +447,22 @@ class App:
         self.apply_theme()
         root.after(100, self.poll)
         root.after(1000, self.clip_poll)
+        root.after(50, self.fit_tabs)
+        threading.Thread(target=self.prep, daemon=True).start()
+
+    def fit_tabs(self):
+        """Força o quadro das abas a ter a altura da maior aba (evita cortar o fim de 'Avançado')."""
+        self.root.update_idletasks()
+        self.nb.configure(height=max(t.winfo_reqheight() for t in self.tabs) + 4)
+
+    def prep(self):
+        def say(m):
+            self.q.put(("status", m))
+            self.q.put(("log", m))
+        try:
+            ensure_deno(say)
+        finally:
+            self.ready.set()
 
     # --- configurações ---
     def save_settings(self):
@@ -596,6 +666,9 @@ class App:
 
     def worker(self, c):
         put, ok, tot, outdir = self.q.put, 0, 0, c["outdir"]
+        if not self.ready.is_set():
+            put(("status", "Preparando o Deno (só na primeira vez)…"))
+            self.ready.wait()
         for k, link in enumerate(c["links"]):
             if self.cancel.is_set():
                 break
@@ -651,6 +724,8 @@ class App:
                 break
             except Exception as ex:
                 put(("log", f"✘ Falhou: {ex}"))
+                if hint(ex):
+                    put(("log", hint(ex)))
             put(("progress", i / n * 100))
         return ok, n, outdir
 
@@ -668,7 +743,7 @@ class App:
 
         name = sanitize_filename(clean(title, c["words"])) if title else ""
         tmpl = os.path.join(outdir, prefix).replace("%", "%%") + (name.replace("%", "%%") or "%(title)s") + ".%(ext)s"
-        o = {"outtmpl": tmpl, "quiet": True, "no_warnings": True, "noplaylist": True,
+        o = {"outtmpl": tmpl, "quiet": True, "no_warnings": False, "noplaylist": True,
              "progress_hooks": [hook], "logger": QuietLogger(self.q)}
         if BROWSER[0]:
             o["cookiesfrombrowser"] = (BROWSER[0],)
