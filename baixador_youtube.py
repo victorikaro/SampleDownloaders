@@ -10,7 +10,7 @@ Para virar .exe com atualização automática, veja launcher.py e build_exe.bat.
 #   CORREÇÃO (2.0.2 -> 2.0.3): conserta erro / ajuste pequeno
 #   MENOR    (2.0.3 -> 2.1.0): função nova (o .exe atual continua servindo)
 #   MAIOR    (2.x.x -> 3.0.0): mudança grande / biblioteca nova -> precisa refazer o .exe
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.0.4"
 
 import io
 import json
@@ -280,12 +280,23 @@ class App:
         self.outdir = tk.StringVar(value=s.get("outdir") or os.path.join(os.path.expanduser("~"), "Downloads"))
         self.status = tk.StringVar(value=os.environ.get("BYT_NOTE") or "Pronto.")
 
-        p = ttk.Frame(root, padding=14)
-        p.pack(fill="both", expand=True)
-
-        # Botões, barra e status ficam presos embaixo (empacotados primeiro): nunca somem, mesmo com janela pequena.
-        bottom = ttk.Frame(p)
+        # Botões, barra, status e log ficam presos embaixo: nunca somem. O resto rola se a tela for pequena.
+        bottom = ttk.Frame(root, padding=(14, 0, 14, 10))
         bottom.pack(side="bottom", fill="x")
+        self.cv = tk.Canvas(root, highlightthickness=0)
+        sb = ttk.Scrollbar(root, orient="vertical", command=self.cv.yview)
+        self.cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.cv.pack(side="left", fill="both", expand=True)
+        p = ttk.Frame(self.cv, padding=14)
+        win = self.cv.create_window((0, 0), window=p, anchor="nw")
+        p.bind("<Configure>", lambda _e: self.cv.configure(scrollregion=self.cv.bbox("all")))
+        self.cv.bind("<Configure>", lambda e: self.cv.itemconfigure(win, width=e.width))
+
+        def wheel(e):  # roda do mouse rola a tela, menos sobre caixas de texto/lista (que rolam sozinhas)
+            if not isinstance(e.widget, (tk.Text, tk.Listbox)) and p.winfo_height() > self.cv.winfo_height():
+                self.cv.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        root.bind_all("<MouseWheel>", wheel)
 
         ttk.Label(p, text="Link do vídeo ou playlist:").pack(anchor="w")
         row = ttk.Frame(p); row.pack(fill="x", pady=(2, 10))
@@ -371,8 +382,8 @@ class App:
 
         self.bar = ttk.Progressbar(bottom, maximum=100); self.bar.pack(fill="x")
         ttk.Label(bottom, textvariable=self.status).pack(anchor="w", pady=(4, 0))
-        self.log = tk.Text(p, height=6, state="disabled", wrap="word")
-        self.log.pack(side="bottom", fill="both", expand=True, pady=(6, 0))
+        self.log = tk.Text(bottom, height=5, state="disabled", wrap="word")
+        self.log.pack(fill="x", pady=(6, 0))
 
         self.url.trace_add("write", self.url_changed)
         self.single.trace_add("write", lambda *_: (setattr(self, "pv_url", None), self.url_changed()))
@@ -522,6 +533,7 @@ class App:
         st.configure("TNotebook.Tab", background=fld, foreground=fg)
         st.map("TCombobox", fieldbackground=[("readonly", fld)], foreground=[("readonly", fg)])
         self.root.configure(bg=bg)
+        self.cv.configure(bg=bg)
         for w in (self.log, self.extra):  # Text aceita cursor colorido
             w.configure(bg=fld, fg=fg, insertbackground=fg)
         self.tracks.configure(bg=fld, fg=fg)  # Listbox não tem insertbackground
