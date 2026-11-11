@@ -2,3 +2,6 @@
 !.gitignore
 !launcher.py
 !baixador_youtube.py
+!build_exe.bat
+!buid.yml
+!setupinstaller.py

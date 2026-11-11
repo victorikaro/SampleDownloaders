@@ -2,16 +2,19 @@
 """
 Baixador de MP3 / MP4 do YouTube (interface gráfica)
 
-Rodar direto:  pip install -U yt-dlp mutagen pillow   ->   python baixador_youtube.py
+Rodar direto:  pip install -U yt-dlp mutagen pillow customtkinter   ->   python baixador_youtube.py
 Precisa do ffmpeg (no PATH ou ffmpeg.exe ao lado do programa).
-Para virar .exe com atualização automática, veja launcher.py e build_exe.bat.
+O .exe e o instalador (Setup) são gerados na nuvem pelo GitHub Actions (build.yml).
 """
-# Versão = MAIOR.MENOR.CORREÇÃO
-#   CORREÇÃO (2.0.2 -> 2.0.3): conserta erro / ajuste pequeno
-#   MENOR    (2.0.3 -> 2.1.0): função nova (o .exe atual continua servindo)
-#   MAIOR    (2.x.x -> 3.0.0): mudança grande / biblioteca nova -> precisa refazer o .exe
-APP_VERSION = "2.0.6"
+# Versão = MAIOR.MENOR.CORREÇÃO (ex.: 3.1.4)
+#   CORREÇÃO (3.1.4 -> 3.1.5): conserta erro / ajuste pequeno
+#   MENOR    (3.1.5 -> 3.2.0): função nova
+#   MAIOR    (3.x.x -> 4.0.0): mudança grande (visual novo, reescrita...)
+# Para publicar: aumente o número abaixo e envie este arquivo ao GitHub. O GitHub Actions gera o
+# BaixadorYT-Setup.exe sozinho e o programa instalado se atualiza quando for aberto.
+APP_VERSION = "3.1.0"
 
+import importlib.machinery
 import io
 import json
 import os
@@ -21,10 +24,17 @@ import shutil
 import sys
 import threading
 import subprocess
+import tempfile
 import urllib.parse
 import urllib.request
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
+
+_HOME = os.path.join(os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config"), "BaixadorYT")
+_YT_ZIP = os.path.join(_HOME, "yt-dlp.zip")
+if os.path.exists(_YT_ZIP):
+    sys.path.insert(0, _YT_ZIP)
+    sys.meta_path.insert(0, importlib.machinery.PathFinder)
 
 try:
     import yt_dlp
@@ -33,8 +43,9 @@ try:
     from mutagen.mp4 import MP4, MP4Cover
     from mutagen.flac import FLAC, Picture
     from PIL import Image, ImageTk
+    import customtkinter as ctk
 except ImportError:
-    sys.exit("Faltam dependências. Rode: pip install -U yt-dlp mutagen pillow")
+    sys.exit("Faltam dependências. Rode: pip install -U yt-dlp mutagen pillow customtkinter")
 
 PW, PH = 320, 180  # tamanho da prévia
 HOME = os.path.join(os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config"), "BaixadorYT")
@@ -42,6 +53,9 @@ CFG = os.path.join(HOME, "config.json")
 ARCHIVE = os.path.join(HOME, "baixados.txt")
 BROWSER = [None]  # navegador para cookies (None = nenhum)
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+FROZEN = getattr(sys, "frozen", False)
+GITHUB_REPO = "SEU_USUARIO/SEU_REPOSITORIO"  # o GitHub Actions troca isto pelo seu repositório na hora de gerar o .exe
+UA = {"User-Agent": "BaixadorYT"}
 os.environ["PATH"] = os.pathsep.join([HOME, os.environ.get("PATH", "")])  # deno.exe / ffmpeg.exe baixados ficam aqui
 
 
@@ -172,6 +186,61 @@ def ensure_deno(say):
         say(f"Não consegui baixar o Deno ({ex}). Instale manualmente em https://deno.com")
         return False
     return deno_ok()
+
+
+def http_get(url, timeout=10):
+    return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout).read()
+
+
+def ensure_ffmpeg(say):
+    """Windows: baixa o ffmpeg sozinho na primeira vez (fica na pasta BaixadorYT do APPDATA)."""
+    if shutil.which("ffmpeg") or os.name != "nt":
+        return
+    try:
+        import zipfile
+        say("Baixando o ffmpeg (só na primeira vez, ~80 MB)…")
+        z = zipfile.ZipFile(io.BytesIO(http_get("https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip", 600)))
+        os.makedirs(HOME, exist_ok=True)
+        for n in z.namelist():
+            if n.endswith(("/bin/ffmpeg.exe", "/bin/ffprobe.exe")):
+                with open(os.path.join(HOME, os.path.basename(n)), "wb") as f:
+                    f.write(z.read(n))
+    except Exception as ex:
+        say(f"Não consegui baixar o ffmpeg ({ex}). Coloque o ffmpeg.exe em {HOME}.")
+
+
+def update_ytdlp(say):
+    """Baixa o yt-dlp mais novo (o YouTube muda toda hora). Passa a valer na próxima abertura."""
+    try:
+        tag = json.loads(http_get("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"))["tag_name"]
+        vf = os.path.join(HOME, "yt-dlp.version")
+        cur = open(vf).read().strip() if os.path.exists(vf) else ""
+        if tag != cur or not os.path.exists(_YT_ZIP):
+            data = http_get("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp", 120)
+            os.makedirs(HOME, exist_ok=True)
+            with open(_YT_ZIP + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(_YT_ZIP + ".tmp", _YT_ZIP)
+            with open(vf, "w") as f:
+                f.write(tag)
+            say(f"yt-dlp atualizado ({tag}). Vale a partir da próxima abertura.")
+    except Exception:
+        pass
+
+
+def check_release():
+    """Procura um release mais novo no GitHub. Retorna (versão, url_do_setup) ou None."""
+    if not FROZEN or "SEU_USUARIO" in GITHUB_REPO:
+        return None
+    try:
+        r = json.loads(http_get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"))
+        new = tuple(int(x) for x in r["tag_name"].lstrip("v").split("."))
+        if new > tuple(int(x) for x in APP_VERSION.split(".")):
+            a = next(x for x in r["assets"] if x["name"].lower().endswith("setup.exe"))
+            return ".".join(map(str, new)), a["browser_download_url"]
+    except Exception:
+        pass
+    return None
 
 
 def hint(msg):
@@ -322,12 +391,58 @@ class QuietLogger:
         self.q.put(("log", str(msg)))
 
 
+# ---------- aparência (estilo web app: cartões arredondados, destaque índigo) ----------
+BG = ("#f4f5f9", "#0f1117"); CARD = ("#ffffff", "#171a23"); FIELD = ("#f1f3f8", "#1f2330"); LINE = ("#e3e6ee", "#2a2f3d")
+TEXT = ("#1b1f2a", "#e6e8ee"); MUTED = ("#6b7280", "#8b92a5")
+ACC, ACC_H, DANGER = "#6366f1", "#4f46e5", "#ef4444"
+ACC_SOFT, ACC_SOFT_H = ("#e0e7ff", "#312e81"), ("#c7d2fe", "#3730a3")
+
+
+def F(size=13, weight="normal"):
+    return ctk.CTkFont(size=size, weight=weight)
+
+
+def card(parent, title=None):
+    c = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14, border_width=1, border_color=LINE)
+    if title:
+        ctk.CTkLabel(c, text=title, font=F(13, "bold"), text_color=TEXT).pack(anchor="w", padx=14, pady=(12, 2))
+    return c
+
+
+def label(parent, text, muted=False):
+    return ctk.CTkLabel(parent, text=text, text_color=MUTED if muted else TEXT, font=F(12 if muted else 13),
+                        anchor="w", justify="left")
+
+
+def entry(parent, var):
+    return ctk.CTkEntry(parent, textvariable=var, height=36, corner_radius=10, fg_color=FIELD,
+                        border_color=LINE, text_color=TEXT, font=F(13))
+
+
+def button(parent, text, cmd, kind="primary", **kw):
+    h = kw.pop("height", 36)
+    st = {"primary": dict(fg_color=ACC, hover_color=ACC_H, text_color="white"),
+          "ghost": dict(fg_color=FIELD, hover_color=LINE, text_color=TEXT),
+          "danger": dict(fg_color="transparent", hover_color=FIELD, text_color=DANGER, border_width=1, border_color=DANGER)}[kind]
+    return ctk.CTkButton(parent, text=text, command=cmd, height=h, corner_radius=10, font=F(13, "bold"), **st, **kw)
+
+
+def switch(parent, text, var, cmd=None):
+    return ctk.CTkSwitch(parent, text=text, variable=var, command=cmd, progress_color=ACC, text_color=TEXT, font=F(13))
+
+
+def option(parent, var, values, width=120):
+    return ctk.CTkOptionMenu(parent, variable=var, values=list(values), width=width, height=32, corner_radius=10,
+                             fg_color=FIELD, button_color=ACC, button_hover_color=ACC_H, text_color=TEXT, font=F(13))
+
+
 # ---------- aplicativo ----------
 class App:
     def __init__(self, root):
         self.root = root
-        root.title(f"Baixador YouTube – MP3 / MP4  (v{APP_VERSION})")
-        root.geometry(f"840x{min(830, max(500, root.winfo_screenheight() - 90))}")  # cabe em telas menores
+        root.title(f"Baixador YouTube  (v{APP_VERSION})")
+        root.geometry(f"1000x{min(800, max(560, root.winfo_screenheight() - 90))}")  # cabe em telas menores
+        root.minsize(900, 520)
         self.q = queue.Queue()
         self.cancel = threading.Event()
         self.ready = threading.Event()  # fica "ligado" quando o Deno está pronto
@@ -348,116 +463,113 @@ class App:
         self.skip = tk.BooleanVar(value=s.get("skip", True))
         self.norm = tk.BooleanVar(value=s.get("norm", False))
         self.itunes = tk.BooleanVar(value=s.get("itunes", False))
-        self.dark = tk.BooleanVar(value=s.get("dark", False))
+        self.dark = tk.BooleanVar(value=s.get("dark", True))
         self.cookies = tk.StringVar(value=s.get("cookies", "Nenhum"))
         self.outdir = tk.StringVar(value=s.get("outdir") or os.path.join(os.path.expanduser("~"), "Downloads"))
         self.status = tk.StringVar(value=os.environ.get("BYT_NOTE") or "Pronto.")
 
-        # Botões, barra, status e log ficam presos embaixo: nunca somem. O resto rola se a tela for pequena.
-        bottom = ttk.Frame(root, padding=(14, 0, 14, 10))
+        # Rodapé fixo (botões, progresso, status, log); o resto rola se a tela for pequena.
+        bottom = ctk.CTkFrame(root, fg_color=CARD, corner_radius=0, border_width=1, border_color=LINE)
         bottom.pack(side="bottom", fill="x")
-        self.cv = tk.Canvas(root, highlightthickness=0)
-        sb = ttk.Scrollbar(root, orient="vertical", command=self.cv.yview)
-        self.cv.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.cv.pack(side="left", fill="both", expand=True)
-        p = ttk.Frame(self.cv, padding=14)
-        win = self.cv.create_window((0, 0), window=p, anchor="nw")
-        p.bind("<Configure>", lambda _e: self.cv.configure(scrollregion=self.cv.bbox("all")))
-        self.cv.bind("<Configure>", lambda e: self.cv.itemconfigure(win, width=e.width))
+        body = ctk.CTkScrollableFrame(root, fg_color=BG, corner_radius=0)
+        body.pack(side="top", fill="both", expand=True)
 
-        def wheel(e):  # roda do mouse rola a tela, menos sobre caixas de texto/lista (que rolam sozinhas)
-            if not isinstance(e.widget, (tk.Text, tk.Listbox)) and p.winfo_height() > self.cv.winfo_height():
-                self.cv.yview_scroll(-1 if e.delta > 0 else 1, "units")
-        root.bind_all("<MouseWheel>", wheel)
+        hd = ctk.CTkFrame(body, fg_color="transparent"); hd.pack(fill="x", padx=8, pady=(6, 12))
+        ctk.CTkLabel(hd, text="▼", width=40, height=40, corner_radius=12, fg_color=ACC, text_color="white",
+                     font=F(18, "bold")).pack(side="left")
+        tt = ctk.CTkFrame(hd, fg_color="transparent"); tt.pack(side="left", padx=12)
+        ctk.CTkLabel(tt, text="Baixador YouTube", font=F(22, "bold"), text_color=TEXT).pack(anchor="w")
+        label(tt, "MP3, M4A, FLAC e MP4 com metadados e capa", muted=True).pack(anchor="w")
+        ctk.CTkLabel(hd, text=f"v{APP_VERSION}", width=64, height=26, corner_radius=13, fg_color=ACC_SOFT,
+                     text_color=TEXT, font=F(12, "bold")).pack(side="right")
 
-        ttk.Label(p, text="Link do vídeo ou playlist:").pack(anchor="w")
-        row = ttk.Frame(p); row.pack(fill="x", pady=(2, 10))
-        ttk.Entry(row, textvariable=self.url).pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text="Colar", command=self.paste).pack(side="left", padx=(6, 0))
+        top = ctk.CTkFrame(body, fg_color="transparent"); top.pack(fill="x", padx=8)
+        top.columnconfigure(0, weight=1)
+        left = ctk.CTkFrame(top, fg_color="transparent"); left.grid(row=0, column=0, sticky="nsew")
+        right = card(top, "Capa  ·  usada no modo Completo"); right.grid(row=0, column=1, sticky="n", padx=(12, 0))
 
-        ttk.Label(p, text="Mais links (um por linha) – entram na fila depois do primeiro:").pack(anchor="w")
-        self.extra = tk.Text(p, height=2)
-        self.extra.pack(fill="x", pady=(2, 8))
+        c1 = card(left, "Link do vídeo ou playlist"); c1.pack(fill="x")
+        r = ctk.CTkFrame(c1, fg_color="transparent"); r.pack(fill="x", padx=14, pady=(4, 8))
+        entry(r, self.url).pack(side="left", fill="x", expand=True)
+        button(r, "Colar", self.paste, "ghost", width=70).pack(side="left", padx=(8, 0))
+        label(c1, "Mais links (um por linha) entram na fila depois do primeiro", muted=True).pack(anchor="w", padx=14)
+        self.extra = ctk.CTkTextbox(c1, height=54, corner_radius=10, fg_color=FIELD, text_color=TEXT,
+                                    border_width=1, border_color=LINE, font=F(13))
+        self.extra.pack(fill="x", padx=14, pady=(4, 14))
 
-        mid = ttk.Frame(p); mid.pack(fill="x")
-        left = ttk.Frame(mid); left.pack(side="left", fill="both", expand=True)
-
-        f1 = ttk.LabelFrame(left, text="Formato", padding=8); f1.pack(fill="x")
-        rf = ttk.Frame(f1); rf.pack(anchor="w")
-        for t in ("MP3", "M4A", "FLAC", "MP4"):
-            ttk.Radiobutton(rf, text=t, value=t, variable=self.fmt, command=self.on_fmt).pack(side="left", padx=(0, 6))
-        ttk.Label(f1, text="Qualidade (kbps / altura):").pack(anchor="w", pady=(6, 0))
-        self.cb = ttk.Combobox(f1, textvariable=self.quality, state="readonly", width=10)
-        self.cb.pack(anchor="w")
+        c2 = card(left, "Formato e modo"); c2.pack(fill="x", pady=(12, 0))
+        r = ctk.CTkFrame(c2, fg_color="transparent"); r.pack(fill="x", padx=14, pady=(4, 10))
+        self.seg(r, {t: t for t in ("MP3", "M4A", "FLAC", "MP4")}, self.fmt, self.on_fmt).pack(side="left")
+        self.cb = option(r, self.quality, ["192"], 110)
+        self.cb.pack(side="right")
+        label(r, "Qualidade").pack(side="right", padx=8)
         self.set_quality_values(keep=True)
+        self.seg(c2, {"Rápido (sem metadados)": "fast", "Completo (metadados + capa)": "full"}, self.mode).pack(
+            fill="x", padx=14, pady=(0, 10))
+        switch(c2, "Só o vídeo (ignorar a playlist do link)", self.single).pack(anchor="w", padx=14, pady=(0, 14))
 
-        f2 = ttk.LabelFrame(left, text="Modo", padding=8); f2.pack(fill="x", pady=(8, 0))
-        ttk.Radiobutton(f2, text="Rápido (sem metadados)", value="fast", variable=self.mode).pack(anchor="w")
-        ttk.Radiobutton(f2, text="Completo (metadados + capa)", value="full", variable=self.mode).pack(anchor="w")
-        ttk.Checkbutton(f2, text="Só o vídeo (ignorar playlist do link)", variable=self.single).pack(anchor="w", pady=(6, 0))
-
-        right = ttk.LabelFrame(mid, text="Capa (usada no modo Completo)", padding=8)
-        right.pack(side="left", padx=(10, 0))
-        self.canvas = tk.Canvas(right, width=PW, height=PH, bg="#222", highlightthickness=0)
-        self.canvas.pack()
+        self.canvas = tk.Canvas(right, width=PW, height=PH, bg="#0b0d12", highlightthickness=0)
+        self.canvas.pack(padx=14, pady=(6, 0))
         self.canvas.bind("<Button-1>", self.on_drag)
         self.canvas.bind("<B1-Motion>", self.on_drag)
-        self.pv_title = ttk.Label(right, text="", wraplength=PW); self.pv_title.pack(anchor="w", pady=(4, 0))
-        r = ttk.Frame(right); r.pack(fill="x")
-        ttk.Radiobutton(r, text="Quadrado (1:1)", value="square", variable=self.crop_mode, command=self.draw).pack(side="left")
-        ttk.Radiobutton(r, text="Original", value="orig", variable=self.crop_mode, command=self.draw).pack(side="left", padx=8)
-        r = ttk.Frame(right); r.pack(fill="x")
-        ttk.Label(r, text="Tamanho do corte:").pack(side="left")
-        ttk.Scale(r, from_=0.4, to=1.0, variable=self.zoom, command=lambda _v: self.draw()).pack(side="left", fill="x", expand=True, padx=6)
-        ttk.Label(right, text="Arraste sobre a imagem para posicionar o corte.", foreground="#666").pack(anchor="w")
+        self.pv_title = ctk.CTkLabel(right, text="", wraplength=PW, justify="left", anchor="w", text_color=TEXT, font=F(12))
+        self.pv_title.pack(anchor="w", padx=14, pady=(6, 0))
+        self.seg(right, {"Quadrado 1:1": "square", "Original": "orig"}, self.crop_mode, self.draw).pack(fill="x", padx=14, pady=(8, 4))
+        r = ctk.CTkFrame(right, fg_color="transparent"); r.pack(fill="x", padx=14)
+        label(r, "Tamanho do corte").pack(side="left")
+        ctk.CTkSlider(r, from_=0.4, to=1.0, variable=self.zoom, command=lambda _v: self.draw(), progress_color=ACC,
+                      button_color=ACC, button_hover_color=ACC_H, width=170).pack(side="right")
+        label(right, "Arraste sobre a imagem para posicionar o corte.", muted=True).pack(anchor="w", padx=14, pady=(2, 14))
 
-        self.nb = nb = ttk.Notebook(p); nb.pack(fill="x", pady=(10, 0))
-        t1, t2, t3 = (ttk.Frame(nb, padding=8) for _ in range(3))
-        self.tabs = (t1, t2, t3)
-        nb.add(t1, text="Metadados e faixas"); nb.add(t2, text="Limpar nomes"); nb.add(t3, text="Avançado")
+        tv = ctk.CTkTabview(body, height=230, corner_radius=14, border_width=1, border_color=LINE, fg_color=CARD,
+                            segmented_button_fg_color=FIELD, segmented_button_selected_color=ACC_SOFT,
+                            segmented_button_selected_hover_color=ACC_SOFT_H, segmented_button_unselected_color=FIELD,
+                            segmented_button_unselected_hover_color=LINE, text_color=TEXT)
+        tv.pack(fill="x", padx=8, pady=12)
+        t1, t2, t3 = (tv.add(n) for n in ("Metadados e faixas", "Limpar nomes", "Avançado"))
 
-        e = ttk.Frame(t1); e.pack(side="left", fill="x", expand=True)
+        e = ctk.CTkFrame(t1, fg_color="transparent"); e.pack(side="left", fill="both", expand=True)
         for i, (lbl, var) in enumerate((("Título (vídeo único)", self.m_title), ("Artista", self.m_artist), ("Álbum", self.m_album))):
-            ttk.Label(e, text=lbl).grid(row=i, column=0, sticky="w", pady=2)
-            ttk.Entry(e, textvariable=var).grid(row=i, column=1, sticky="ew", padx=6)
+            label(e, lbl).grid(row=i, column=0, sticky="w", pady=4)
+            entry(e, var).grid(row=i, column=1, sticky="ew", padx=(8, 0))
         e.columnconfigure(1, weight=1)
-        ttk.Label(e, text="Preenchido pela prévia; edite à vontade. Vale para o 1º link.", foreground="#777").grid(row=3, column=0, columnspan=2, sticky="w")
-        tr = ttk.Frame(t1); tr.pack(side="left", padx=(10, 0))
-        ttk.Label(tr, text="Faixas da playlist (nada marcado = todas):").pack(anchor="w")
-        self.tracks = tk.Listbox(tr, selectmode="extended", height=5, width=46, exportselection=False)
-        self.tracks.pack()
+        label(e, "Preenchido pela prévia; edite à vontade. Vale para o 1º link.", muted=True).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        tr = ctk.CTkFrame(t1, fg_color="transparent"); tr.pack(side="left", padx=(16, 0))
+        label(tr, "Faixas da playlist (nada marcado = todas)", muted=True).pack(anchor="w")
+        self.tracks = tk.Listbox(tr, selectmode="extended", height=6, width=42, exportselection=False, relief="flat",
+                                 highlightthickness=0, bd=0, activestyle="none", font=("Segoe UI", 10))
+        self.tracks.pack(pady=(4, 0))
 
-        ttk.Checkbutton(t2, text="Remover automaticamente (Official Video), [Official Audio], (Lyrics), (Áudio Oficial), (HD)…",
-                        variable=self.auto).pack(anchor="w")
-        ttk.Label(t2, text="Outros textos para ignorar (separe por vírgula):").pack(anchor="w", pady=(6, 0))
-        ttk.Entry(t2, textvariable=self.ignore).pack(fill="x", pady=2)
+        switch(t2, "Remover automaticamente (Official Video), [Official Audio], (Lyrics), (Áudio Oficial), (HD)…",
+               self.auto).pack(anchor="w")
+        label(t2, "Outros textos para ignorar (separe por vírgula)").pack(anchor="w", pady=(10, 2))
+        entry(t2, self.ignore).pack(fill="x")
 
-        for txt, var in (("Pular o que já foi baixado antes (desmarque para baixar de novo)", self.skip),
-                         ("Normalizar o volume (só áudio)", self.norm),
-                         ("Usar capa oficial do álbum (iTunes) em vídeo único, se encontrar", self.itunes),
-                         ("Tema escuro", self.dark)):
-            ttk.Checkbutton(t3, text=txt, variable=var, command=self.apply_theme).pack(anchor="w")
-        r = ttk.Frame(t3); r.pack(anchor="w", pady=(4, 0))
-        ttk.Label(r, text="Usar cookies do navegador (vídeos restritos):").pack(side="left")
-        ttk.Combobox(r, textvariable=self.cookies, values=("Nenhum", "chrome", "edge", "firefox", "brave", "opera"),
-                     state="readonly", width=10).pack(side="left", padx=6)
+        for i, (txt, var) in enumerate((("Pular o que já foi baixado", self.skip), ("Normalizar o volume (só áudio)", self.norm),
+                                        ("Capa oficial do álbum (iTunes), vídeo único", self.itunes), ("Tema escuro", self.dark))):
+            switch(t3, txt, var, self.apply_theme).grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 28), pady=5)
+        r = ctk.CTkFrame(t3, fg_color="transparent"); r.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        label(r, "Cookies do navegador (vídeos restritos)").pack(side="left")
+        option(r, self.cookies, ("Nenhum", "chrome", "edge", "firefox", "brave", "opera")).pack(side="left", padx=8)
 
-        ttk.Label(p, text="Salvar em:").pack(anchor="w", pady=(10, 0))
-        row = ttk.Frame(p); row.pack(fill="x", pady=2)
-        ttk.Entry(row, textvariable=self.outdir).pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text="Escolher…", command=self.pick_dir).pack(side="left", padx=(6, 0))
+        c3 = card(body, "Salvar em"); c3.pack(fill="x", padx=8)
+        r = ctk.CTkFrame(c3, fg_color="transparent"); r.pack(fill="x", padx=14, pady=(4, 14))
+        entry(r, self.outdir).pack(side="left", fill="x", expand=True)
+        button(r, "Escolher…", self.pick_dir, "ghost", width=100).pack(side="left", padx=(8, 0))
 
-        row = ttk.Frame(bottom); row.pack(fill="x", pady=(10, 6))
-        self.btn_go = ttk.Button(row, text="Baixar", command=self.start); self.btn_go.pack(side="left")
-        self.btn_stop = ttk.Button(row, text="Cancelar", command=self.cancel.set, state="disabled")
-        self.btn_stop.pack(side="left", padx=6)
-        ttk.Button(row, text="Abrir pasta", command=self.open_dir).pack(side="left")
-
-        self.bar = ttk.Progressbar(bottom, maximum=100); self.bar.pack(fill="x")
-        ttk.Label(bottom, textvariable=self.status).pack(anchor="w", pady=(4, 0))
-        self.log = tk.Text(bottom, height=5, state="disabled", wrap="word")
-        self.log.pack(fill="x", pady=(6, 0))
+        row = ctk.CTkFrame(bottom, fg_color="transparent"); row.pack(fill="x", padx=16, pady=(12, 8))
+        self.btn_go = button(row, "Baixar", self.start, height=40, width=140); self.btn_go.pack(side="left")
+        self.btn_stop = button(row, "Cancelar", self.cancel.set, "danger", height=40, width=110, state="disabled")
+        self.btn_stop.pack(side="left", padx=8)
+        button(row, "Abrir pasta", self.open_dir, "ghost", height=40, width=120).pack(side="left")
+        self.bar = ctk.CTkProgressBar(bottom, height=8, progress_color=ACC, fg_color=FIELD)
+        self.bar.set(0); self.bar.pack(fill="x", padx=16)
+        ctk.CTkLabel(bottom, textvariable=self.status, anchor="w", justify="left", wraplength=940,
+                     text_color=MUTED, font=F(12)).pack(fill="x", padx=16, pady=(4, 0))
+        self.log = ctk.CTkTextbox(bottom, height=56, corner_radius=10, fg_color=FIELD, text_color=TEXT,
+                                  font=("Consolas", 12), state="disabled")
+        self.log.pack(fill="x", padx=16, pady=(6, 12))
 
         self.url.trace_add("write", self.url_changed)
         self.single.trace_add("write", lambda *_: (setattr(self, "pv_url", None), self.url_changed()))
@@ -467,13 +579,21 @@ class App:
         self.apply_theme()
         root.after(100, self.poll)
         root.after(1000, self.clip_poll)
-        root.after(50, self.fit_tabs)
         threading.Thread(target=self.prep, daemon=True).start()
 
-    def fit_tabs(self):
-        """Força o quadro das abas a ter a altura da maior aba (evita cortar o fim de 'Avançado')."""
-        self.root.update_idletasks()
-        self.nb.configure(height=max(t.winfo_reqheight() for t in self.tabs) + 4)
+    def seg(self, parent, opts, var, cmd=None):
+        """Botão segmentado: opts = {texto mostrado: valor guardado na variável}."""
+        inv = {v: k for k, v in opts.items()}
+
+        def on(lbl):
+            var.set(opts[lbl])
+            if cmd:
+                cmd()
+        w = ctk.CTkSegmentedButton(parent, values=list(opts), command=on, fg_color=FIELD, selected_color=ACC_SOFT,
+                                   selected_hover_color=ACC_SOFT_H, unselected_color=FIELD, unselected_hover_color=LINE,
+                                   text_color=TEXT, font=F(13))
+        w.set(inv.get(var.get(), next(iter(opts))))
+        return w
 
     def prep(self):
         def say(m):
@@ -481,8 +601,13 @@ class App:
             self.q.put(("log", m))
         try:
             ensure_deno(say)
+            ensure_ffmpeg(say)
         finally:
             self.ready.set()
+        update_ytdlp(say)
+        r = check_release()
+        if r:
+            self.q.put(("update", r))
 
     # --- configurações ---
     def save_settings(self):
@@ -499,7 +624,7 @@ class App:
     def set_quality_values(self, keep=False):
         f = self.fmt.get()
         vals = {"MP4": ("Melhor", "1080", "720", "480", "360"), "FLAC": ("Sem perda",)}.get(f, ("128", "192", "256", "320"))
-        self.cb["values"] = vals
+        self.cb.configure(values=list(vals))
         if not (keep and self.quality.get() in vals):
             self.quality.set({"MP4": "Melhor", "FLAC": "Sem perda"}.get(f, "192"))
 
@@ -519,10 +644,10 @@ class App:
             self.save_settings()
 
     def log_add(self, text):
-        self.log.config(state="normal")
+        self.log.configure(state="normal")
         self.log.insert("end", text + "\n")
         self.log.see("end")
-        self.log.config(state="disabled")
+        self.log.configure(state="disabled")
 
     # --- prévia e corte da capa ---
     def url_changed(self, *_):
@@ -535,7 +660,7 @@ class App:
         if not url.startswith("http") or url == self.pv_url:
             return
         self.pv_url = url
-        self.pv_title.config(text="Carregando prévia…")
+        self.pv_title.configure(text="Carregando prévia…")
         BROWSER[0] = None if self.cookies.get() == "Nenhum" else self.cookies.get()
         threading.Thread(target=self.preview_worker, args=(url, self.single.get(), self.words()), daemon=True).start()
 
@@ -554,7 +679,7 @@ class App:
         if url != self.pv_url:
             return
         self.pv_img, self.cx, self.cy = img, 0.5, 0.5
-        self.pv_title.config(text=title)
+        self.pv_title.configure(text=title)
         self.tracks.delete(0, "end")
         for i, t in enumerate(tracks, 1):
             self.tracks.insert("end", f"{i:02d} - {t}")
@@ -616,17 +741,44 @@ class App:
         self.root.after(1000, self.clip_poll)
 
     def apply_theme(self):
-        bg, fg, fld = ("#1e1e1e", "#e8e8e8", "#2b2b2b") if self.dark.get() else ("#f0f0f0", "#111111", "#ffffff")
-        st = ttk.Style()
-        st.theme_use("clam")
-        st.configure(".", background=bg, foreground=fg, fieldbackground=fld)
-        st.configure("TNotebook.Tab", background=fld, foreground=fg)
-        st.map("TCombobox", fieldbackground=[("readonly", fld)], foreground=[("readonly", fg)])
-        self.root.configure(bg=bg)
-        self.cv.configure(bg=bg)
-        for w in (self.log, self.extra):  # Text aceita cursor colorido
-            w.configure(bg=fld, fg=fg, insertbackground=fg)
-        self.tracks.configure(bg=fld, fg=fg)  # Listbox não tem insertbackground
+        d = self.dark.get()
+        ctk.set_appearance_mode("dark" if d else "light")
+        self.root.configure(fg_color=BG)
+        self.canvas.configure(bg="#0b0d12" if d else "#e9ebf2")
+        self.tracks.configure(bg=FIELD[1] if d else FIELD[0], fg=TEXT[1] if d else TEXT[0],
+                              selectbackground=ACC, selectforeground="white")
+        self.draw()
+
+    # --- atualização do programa (baixa o Setup novo inteiro e instala por cima) ---
+    def ask_update(self, ver, url):
+        if messagebox.askyesno("Atualização disponível",
+                               f"Existe a versão {ver} (você está na {APP_VERSION}).\nBaixar e instalar agora?"):
+            self.btn_go.configure(state="disabled")
+            threading.Thread(target=self.do_update, args=(url,), daemon=True).start()
+
+    def do_update(self, url):
+        put = self.q.put
+        try:
+            path = os.path.join(tempfile.gettempdir(), "BaixadorYT-Setup.exe")
+            with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r, open(path, "wb") as f:
+                total, got = int(r.headers.get("Content-Length") or 0), 0
+                while True:
+                    chunk = r.read(1 << 18)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if total:
+                        put(("progress", got * 100 / total))
+                        put(("status", f"Baixando a atualização… {got * 100 // total}%"))
+            put(("install", path))
+        except Exception as ex:
+            put(("done", f"Não consegui baixar a atualização: {ex}"))
+
+    def run_setup(self, path):
+        self.save_settings()
+        subprocess.Popen([path, "/update"], creationflags=0x00000008)  # DETACHED_PROCESS: continua depois de fechar o app
+        self.root.destroy()
 
     def open_dir(self):
         d = self.outdir.get()
@@ -646,12 +798,16 @@ class App:
                 elif k == "status":
                     self.status.set(v)
                 elif k == "progress":
-                    self.bar["value"] = v
+                    self.bar.set(v / 100)
                 elif k == "preview":
                     self.set_preview(*v)
+                elif k == "update":
+                    self.ask_update(*v)
+                elif k == "install":
+                    self.run_setup(v)
                 elif k == "done":
-                    self.btn_go.config(state="normal")
-                    self.btn_stop.config(state="disabled")
+                    self.btn_go.configure(state="normal")
+                    self.btn_stop.configure(state="disabled")
                     self.status.set(v)
                     self.root.bell()
                     messagebox.showinfo("Baixador YouTube", v)
@@ -664,7 +820,7 @@ class App:
         if not url:
             messagebox.showwarning("Link vazio", "Cole o link do YouTube primeiro.")
             return
-        if not shutil.which("ffmpeg"):
+        if self.ready.is_set() and not shutil.which("ffmpeg"):
             messagebox.showerror("ffmpeg não encontrado",
                                  "Instale o ffmpeg ou coloque o ffmpeg.exe na mesma pasta do programa.")
             return
@@ -680,9 +836,9 @@ class App:
                "skip": self.skip.get(), "norm": self.norm.get(), "itunes": self.itunes.get(),
                "cover_img": self.pv_img if self.pv_url == url else None}
         self.cancel.clear()
-        self.bar["value"] = 0
-        self.btn_go.config(state="disabled")
-        self.btn_stop.config(state="normal")
+        self.bar.set(0)
+        self.btn_go.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
         threading.Thread(target=self.worker, args=(cfg,), daemon=True).start()
 
     def worker(self, c):
@@ -791,6 +947,6 @@ class App:
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    root = ctk.CTk()
     App(root)
     root.mainloop()
