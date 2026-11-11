@@ -27,7 +27,7 @@ import time
 import urllib.request
 
 # Pode deixar assim: na primeira abertura o programa pergunta o repositório e guarda.
-REPO = "SEU_USUARIO/SEU_REPOSITORIO"
+REPO = "victorikaro/SampleDownloaders"
 BRANCH = "main"
 APP_FILE = "baixador_youtube.py"
 EXE_MAJOR = 2
