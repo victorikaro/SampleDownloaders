@@ -30,7 +30,7 @@ import urllib.request
 REPO = "SEU_USUARIO/SEU_REPOSITORIO"
 BRANCH = "main"
 APP_FILE = "baixador_youtube.py"
-EXE_MAJOR = 3
+EXE_MAJOR = 2
 
 FROZEN = getattr(sys, "frozen", False)
 BASE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
@@ -47,7 +47,6 @@ def _deps():
     import tkinter, tkinter.ttk, tkinter.filedialog, tkinter.messagebox  # noqa
     import mutagen.id3, mutagen.mp4, mutagen.flac  # noqa
     import PIL.Image, PIL.ImageTk  # noqa
-    import customtkinter  # noqa
 
 
 def ver(data):
